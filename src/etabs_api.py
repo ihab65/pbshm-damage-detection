@@ -24,30 +24,55 @@ except ImportError:
 # API Connection
 # ---------------------------------------------------------------------------
 
-def start_API(verbose=True):
+def start_api(verbose=True):
     """
-    Starts the SAP2000 API and creates an application to control it.
+    Starts the ETABS API and creates an application to control it.
 
     Returns
     -------
     SapModel or int
         The SapModel object on success, or 1 on failure.
     """
-    helper = comtypes.client.CreateObject('SAP2000v1.Helper')
-    helper = helper.QueryInterface(comtypes.gen.SAP2000v1.cHelper)
+    helper = comtypes.client.CreateObject('ETABSv1.Helper')
 
-    mySapObject = helper.GetObject("CSI.SAP2000.API.SapObject")
+    myETABSObject = helper.GetObject("CSI.ETABS.API.ETABSObject")
     try:
-        mySapObject.ApplicationStart()
+        myETABSObject.ApplicationStart()
         if verbose:
-            print("SAP2000 API started successfully")
+            print("Etabs API started successfully")
     except:
         if verbose:
-            print("SAP2000 API failed to connect")
+            print("Etabs API failed to connect")
         return 1
+    SapModel = myETABSObject.SapModel
 
-    SapModel = mySapObject.SapModel
     return SapModel
+
+
+def setup_sensor_group(SapModel, group_name, sensor_ids):
+    """
+    Creates a group in ETABS/SAP2000 and assigns the specified joint IDs to it.
+    """
+    print(f"Setting up group '{group_name}' with {len(sensor_ids)} sensors...")
+
+    # 1. Unlock the model (assignments cannot be made to a locked model)
+    SapModel.SetModelIsLocked(False)
+
+    # 2. Define the new group
+    SapModel.GroupDef.SetGroup(group_name)
+
+    # 3. Assign each sensor joint to the group
+    success_count = 0
+    for j_id in sensor_ids:
+        # The API requires the joint name as a string
+        ret = SapModel.PointObj.SetGroupAssign(str(j_id), group_name)
+
+        if ret == 0:
+            success_count += 1
+        else:
+            print(f"  [Warning] Failed to add Joint ID '{j_id}' to group. Check if it exists.")
+
+    print(f"Successfully added {success_count}/{len(sensor_ids)} joints to '{group_name}'.")
 
 
 # ---------------------------------------------------------------------------
@@ -63,15 +88,17 @@ def set_material(mat_name, E, SapModel):
 # Damage Pattern & Modal Analysis
 # ---------------------------------------------------------------------------
 
-def create_dp(SapModel, severity, group_name, E_i, mat_names):
+def create_dp(SapModel, severity, group_name, E_i, mat_names, n_modes=12):
     """
     Create a damage pattern by modifying material stiffness, run analysis,
     and retrieve mode shapes and frequencies.
 
+    Used by the flexibility-matrix pipeline to simulate damage scenarios.
+
     Parameters
     ----------
     SapModel : object
-        The SAP2000 model object.
+        The ETABS/SAP2000 model object.
     severity : list
         List of severity values (0–1) for each element/zone.
     group_name : str
@@ -80,23 +107,43 @@ def create_dp(SapModel, severity, group_name, E_i, mat_names):
         Initial Young's modulus.
     mat_names : list
         List of material names corresponding to each zone.
+    n_modes : int
+        Number of modes in the modal analysis (default 12).
 
     Returns
     -------
     tuple
         (Frequency, mode_shapes) arrays.
+        mode_shapes has shape (3*n_joints, n_modes).
     """
     SapModel.SetModelIsLocked(False)
-    # Edit materials
+    # Edit materials according to damage severity
     for i, s in enumerate(severity):
         E = E_i * (1 - s)
         set_material(mat_names[i], E, SapModel)
     # Run analysis
     SapModel.Analyze.RunAnalysis()
-    # Get results
-    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
-    SapModel.Results.Setup.SetCaseSelectedForOutput("MODAL")
 
+    # Select only the Modal case for output
+    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
+
+    # Auto-detect the modal case name
+    NumberNames, case_names, ret_code = SapModel.LoadCases.GetNameList()
+    modal_case_name = "Modal"  # Default fallback
+    if ret_code == 0:
+        for name in case_names:
+            case_type, sub_type, design_type, design_opt, auto, ret = \
+                SapModel.LoadCases.GetTypeOAPI_1(name)
+            if case_type == 3:  # 3 = Modal Cases
+                modal_case_name = name
+                break
+
+    SapModel.Results.Setup.SetCaseSelectedForOutput(modal_case_name)
+
+    # ETABS fix: tell the API to output ALL modes (SAP2000 does this by default)
+    SapModel.Results.Setup.SetOptionModeShape(1, n_modes, True)
+
+    # Group-based ModeShape extraction (ObjectElm=2 → GroupElm)
     NumberResults = 0
     Obj = ""
     Elm = ""
@@ -109,18 +156,20 @@ def create_dp(SapModel, severity, group_name, E_i, mat_names):
     R1 = []
     R2 = []
     R3 = []
-    # Retrieve mode shape results
-    NumberResults, Obj, Elm, LoadCase, StepType, StepNum, U1, U2, U3, R1, R2, R3, n = \
-        SapModel.Results.ModeShape(
+
+    NumberResults, Obj, Elm, LoadCase, StepType, StepNum, \
+        U1, U2, U3, R1, R2, R3, n = SapModel.Results.ModeShape(
             group_name, 2, NumberResults, Obj, Elm, LoadCase,
             StepType, StepNum, U1, U2, U3, R1, R2, R3
         )
+
     [_, _, _, _, _, _, Frequency, _, _] = SapModel.Results.ModalPeriod(
         0, '', '', [], [], [], [], []
     )
-    U1 = np.array(U1).reshape((12, -1))
-    U2 = np.array(U2).reshape((12, -1))
-    U3 = np.array(U3).reshape((12, -1))
+
+    U1 = np.array(U1).reshape((n_modes, -1))
+    U2 = np.array(U2).reshape((n_modes, -1))
+    U3 = np.array(U3).reshape((n_modes, -1))
     mode_shapes = np.concatenate([U1.T, U2.T, U3.T], axis=0)
 
     return Frequency, mode_shapes
@@ -265,3 +314,117 @@ def generate_unique_combinations(n=5000, step=0.05, n_elements=3):
     np.random.shuffle(all_combinations)
     result = all_combinations[:n]
     return result
+
+
+def extract_and_save_mode_shapes(SapModel, group_name, E_i, mat_names,
+                                 n_elements, out_csv_path, n_modes=12):
+    """
+    Extract undamaged mode shapes for all candidate sensors and save to CSV.
+
+    This is a dedicated extraction function — it does NOT reuse create_dp
+    (which is designed for damage-pattern simulation + flexibility matrices).
+
+    Key ETABS difference vs SAP2000:
+        ETABS requires an explicit call to
+            SapModel.Results.Setup.SetOptionModeShape(1, n_modes, True)
+        to include ALL modes in the output. Without it, ETABS defaults to
+        returning only 1 mode, whereas SAP2000 returns all modes by default.
+
+    Parameters
+    ----------
+    SapModel : object
+        The ETABS model object.
+    group_name : str
+        Name of the joint group containing all candidate sensors.
+    E_i : float
+        Initial (undamaged) Young's modulus.
+    mat_names : list[str]
+        Material names for each zone.
+    n_elements : int
+        Number of zones / elements.
+    out_csv_path : str
+        Path to save the mode shape CSV.
+    n_modes : int
+        Number of modes in the modal analysis (default 12).
+
+    Saves
+    -----
+    CSV file with shape (n_modes, 3*n_sensors) ready for SNPO reshaping
+    to (n_modes, 3, n_sensors).
+    """
+    print(f"Extracting mode shapes for group '{group_name}'...")
+
+    # 1. Set undamaged material properties and run analysis
+    SapModel.SetModelIsLocked(False)
+    for i in range(n_elements):
+        set_material(mat_names[i], E_i, SapModel)   # 0% damage → full E
+    SapModel.Analyze.RunAnalysis()
+
+    # 2. Configure output: select only the Modal case
+    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
+
+    # Auto-detect the modal case name
+    NumberNames, case_names, ret_code = SapModel.LoadCases.GetNameList()
+    modal_case_name = "Modal"  # Default fallback
+    if ret_code == 0:
+        for name in case_names:
+            case_type, sub_type, design_type, design_opt, auto, ret = \
+                SapModel.LoadCases.GetTypeOAPI_1(name)
+            if case_type == 3:  # 3 = Modal Cases
+                modal_case_name = name
+                break
+
+    SapModel.Results.Setup.SetCaseSelectedForOutput(modal_case_name)
+
+    # 3. *** CRITICAL ETABS FIX ***
+    #    Tell ETABS to output ALL mode shapes (modes 1 through n_modes).
+    #    Without this call ETABS returns only 1 mode by default.
+    #    SAP2000 does not need this — it returns all modes automatically.
+    SapModel.Results.Setup.SetOptionModeShape(1, n_modes, True)
+
+    # 4. Group-based ModeShape extraction (matching old SAP2000 approach)
+    #    ObjectElm=2 → GroupElm: results for every joint in the group
+    NumberResults = 0
+    Obj = ""
+    Elm = ""
+    LoadCase = ""
+    StepType = ""
+    StepNum = []
+    U1 = []
+    U2 = []
+    U3 = []
+    R1 = []
+    R2 = []
+    R3 = []
+
+    NumberResults, Obj, Elm, LoadCase, StepType, StepNum, \
+        U1, U2, U3, R1, R2, R3, ret = SapModel.Results.ModeShape(
+            group_name, 2, NumberResults, Obj, Elm, LoadCase,
+            StepType, StepNum, U1, U2, U3, R1, R2, R3
+        )
+
+    print(f"   ModeShape returned {NumberResults} results (ret={ret})")
+
+    if NumberResults == 0 or ret != 0:
+        raise RuntimeError(
+            f"ModeShape extraction failed for group '{group_name}' "
+            f"(NumberResults={NumberResults}, ret={ret})."
+        )
+
+    # 5. Reshape flat arrays → (n_modes, n_joints) per direction
+    U1 = np.array(U1).reshape((n_modes, -1))
+    U2 = np.array(U2).reshape((n_modes, -1))
+    U3 = np.array(U3).reshape((n_modes, -1))
+    n_joints = U1.shape[1]
+
+    # 6. Build the mode-shape matrix expected by SNPO:
+    #    Concatenate directions → (n_modes, 3*n_joints)
+    mode_shapes_for_snpo = np.concatenate([U1, U2, U3], axis=1)
+
+    # 7. Save
+    np.savetxt(out_csv_path, mode_shapes_for_snpo, delimiter=",")
+
+    print(f"✅ Mode shapes successfully saved to {out_csv_path}")
+    print(f"   Shape: {mode_shapes_for_snpo.shape}")
+    print(f"   (n_modes={n_modes}, 3*n_sensors={3*n_joints}, "
+          f"n_sensors={n_joints})")
