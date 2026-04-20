@@ -117,17 +117,8 @@ def create_dp(SapModel, severity, group_name, E_i, mat_names, n_modes=12):
         mode_shapes has shape (3*n_joints, n_modes).
     """
     SapModel.SetModelIsLocked(False)
-    # Edit materials according to damage severity
-    for i, s in enumerate(severity):
-        E = E_i * (1 - s)
-        set_material(mat_names[i], E, SapModel)
-    # Run analysis
-    SapModel.Analyze.RunAnalysis()
 
-    # Select only the Modal case for output
-    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
-
-    # Auto-detect the modal case name
+    # Auto-detect the modal case name BEFORE analysis
     NumberNames, case_names, ret_code = SapModel.LoadCases.GetNameList()
     modal_case_name = "Modal"  # Default fallback
     if ret_code == 0:
@@ -138,6 +129,19 @@ def create_dp(SapModel, severity, group_name, E_i, mat_names, n_modes=12):
                 modal_case_name = name
                 break
 
+    # Force ETABS to compute exactly n_modes
+    SapModel.LoadCases.ModalEigen.SetNumberModes(modal_case_name, n_modes, 1)
+
+    # Edit materials according to damage severity
+    for i, s in enumerate(severity):
+        E = E_i * (1 - s)
+        set_material(mat_names[i], E, SapModel)
+    
+    # Run analysis
+    SapModel.Analyze.RunAnalysis()
+
+    # Select only the Modal case for output
+    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
     SapModel.Results.Setup.SetCaseSelectedForOutput(modal_case_name)
 
     # ETABS fix: tell the API to output ALL modes (SAP2000 does this by default)
@@ -167,10 +171,22 @@ def create_dp(SapModel, severity, group_name, E_i, mat_names, n_modes=12):
         0, '', '', [], [], [], [], []
     )
 
-    U1 = np.array(U1).reshape((n_modes, -1))
-    U2 = np.array(U2).reshape((n_modes, -1))
-    U3 = np.array(U3).reshape((n_modes, -1))
-    mode_shapes = np.concatenate([U1.T, U2.T, U3.T], axis=0)
+    if not StepNum:
+        raise RuntimeError(f"No mode shapes returned for group '{group_name}'.")
+
+    # Determine the actual number of modes returned by ETABS
+    actual_n_modes = len(set(StepNum))
+    if actual_n_modes != n_modes:
+        print(f"  [Warning] Requested {n_modes} modes, but ETABS computed {actual_n_modes}.")
+
+    # ETABS groups by Object, then by Mode. 
+    # Reshaping to (-1, actual_n_modes) correctly assigns columns to modes.
+    U1 = np.array(U1).reshape((-1, actual_n_modes))
+    U2 = np.array(U2).reshape((-1, actual_n_modes))
+    U3 = np.array(U3).reshape((-1, actual_n_modes))
+    
+    # Because U1 is now (n_joints, actual_n_modes), we no longer need .T
+    mode_shapes = np.concatenate([U1, U2, U3], axis=0)
 
     return Frequency, mode_shapes
 
@@ -195,12 +211,11 @@ def flexibility_matrix(Frequency, mode_shapes):
     ndarray
         The flexibility matrix.
     """
-    f = 2 * np.pi * np.array(Frequency)
-    f = np.diag(f)
+    omega = 2 * np.pi * np.array(Frequency)
+    # Modal flexibility:  F = Φ diag(1/ωᵢ²) Φᵀ
+    inv_omega2 = np.diag(1.0 / omega**2)
 
-    t = mode_shapes
-    np.dot(f, t.T)
-    Flexibility = np.dot(t, np.dot(f, t.T))
+    Flexibility = mode_shapes @ inv_omega2 @ mode_shapes.T
     return Flexibility
 
 
@@ -354,16 +369,9 @@ def extract_and_save_mode_shapes(SapModel, group_name, E_i, mat_names,
     """
     print(f"Extracting mode shapes for group '{group_name}'...")
 
-    # 1. Set undamaged material properties and run analysis
+    # 1. Unlock and detect Modal Case
     SapModel.SetModelIsLocked(False)
-    for i in range(n_elements):
-        set_material(mat_names[i], E_i, SapModel)   # 0% damage → full E
-    SapModel.Analyze.RunAnalysis()
-
-    # 2. Configure output: select only the Modal case
-    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
-
-    # Auto-detect the modal case name
+    
     NumberNames, case_names, ret_code = SapModel.LoadCases.GetNameList()
     modal_case_name = "Modal"  # Default fallback
     if ret_code == 0:
@@ -373,7 +381,17 @@ def extract_and_save_mode_shapes(SapModel, group_name, E_i, mat_names,
             if case_type == 3:  # 3 = Modal Cases
                 modal_case_name = name
                 break
+                
+    # Force ETABS to compute exactly n_modes
+    SapModel.LoadCases.ModalEigen.SetNumberModes(modal_case_name, n_modes, 1)
 
+    # 2. Set undamaged material properties and run analysis
+    for i in range(n_elements):
+        set_material(mat_names[i], E_i, SapModel)   # 0% damage → full E
+    SapModel.Analyze.RunAnalysis()
+
+    # 3. Configure output: select only the Modal case
+    SapModel.Results.Setup.DeselectAllCasesAndCombosForOutput()
     SapModel.Results.Setup.SetCaseSelectedForOutput(modal_case_name)
 
     # 3. *** CRITICAL ETABS FIX ***
@@ -405,21 +423,29 @@ def extract_and_save_mode_shapes(SapModel, group_name, E_i, mat_names,
 
     print(f"   ModeShape returned {NumberResults} results (ret={ret})")
 
-    if NumberResults == 0 or ret != 0:
+    if NumberResults == 0 or ret != 0 or not StepNum:
         raise RuntimeError(
             f"ModeShape extraction failed for group '{group_name}' "
             f"(NumberResults={NumberResults}, ret={ret})."
         )
 
-    # 5. Reshape flat arrays → (n_modes, n_joints) per direction
-    U1 = np.array(U1).reshape((n_modes, -1))
-    U2 = np.array(U2).reshape((n_modes, -1))
-    U3 = np.array(U3).reshape((n_modes, -1))
-    n_joints = U1.shape[1]
+    # Determine the actual number of modes returned by ETABS
+    actual_n_modes = len(set(StepNum))
+    if actual_n_modes != n_modes:
+        print(f"  [Warning] Requested {n_modes} modes, but ETABS computed {actual_n_modes}.")
+
+    # ETABS groups by Object, then by Mode. 
+    # Reshaping to (-1, actual_n_modes) correctly assigns columns to modes.
+    U1 = np.array(U1).reshape((-1, actual_n_modes))
+    U2 = np.array(U2).reshape((-1, actual_n_modes))
+    U3 = np.array(U3).reshape((-1, actual_n_modes))
+    
+    n_joints = U1.shape[0]
 
     # 6. Build the mode-shape matrix expected by SNPO:
-    #    Concatenate directions → (n_modes, 3*n_joints)
-    mode_shapes_for_snpo = np.concatenate([U1, U2, U3], axis=1)
+    #    Since U1 is (n_joints, actual_n_modes), SNPO expects (actual_n_modes, 3*n_joints)
+    #    We must transpose to (actual_n_modes, n_joints) BEFORE concatenating along axis=1
+    mode_shapes_for_snpo = np.concatenate([U1.T, U2.T, U3.T], axis=1)
 
     # 7. Save
     np.savetxt(out_csv_path, mode_shapes_for_snpo, delimiter=",")
