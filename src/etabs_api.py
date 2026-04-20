@@ -271,16 +271,29 @@ def create_dataset(batch_array, SapModel, group_name, E_i, mat_names,
 def run_batches(dataset_array, batch_size, SapModel, group_name, E_i,
                 mat_names, not_damaged_file, output_dir):
     """
-    Orchestrate batch processing: split dataset_array into batches,
-    generate damage indicators, and save each batch to CSV.
+    Orchestrate batch processing with CRASH RECOVERY: 
+    Splits dataset_array into batches, generates damage indicators, 
+    and skips any batch that already exists in the output_dir.
     """
+    # Ensure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
     all_csv_paths = []
     n_batches = int(np.ceil(len(dataset_array) / batch_size))
 
     for i in range(n_batches):
+        batch_path = os.path.join(output_dir, f"batch_{i + 1:03d}.csv")
+        all_csv_paths.append(batch_path)
+        
+        # --- CRASH RECOVERY LOGIC ---
+        # If the file already exists, ETABS already finished it. Skip it!
+        if os.path.exists(batch_path):
+            print(f" Skipping batch {i + 1}/{n_batches} | File already exists: {batch_path}")
+            continue
+
+        # If it doesn't exist, slice the array and run ETABS
         batch = dataset_array[i * batch_size:(i + 1) * batch_size]
-        print(f"\nProcessing batch {i + 1}/{n_batches} "
-              f"with {len(batch)} samples...")
+        print(f"\n Processing batch {i + 1}/{n_batches} with {len(batch)} samples...")
 
         # Generate dataset
         damage_indicators = create_dataset(
@@ -289,9 +302,8 @@ def run_batches(dataset_array, batch_size, SapModel, group_name, E_i,
 
         # Save batch to CSV
         batch_df = pd.DataFrame(damage_indicators)
-        batch_path = os.path.join(output_dir, f"batch_{i + 1:03d}.csv")
         batch_df.to_csv(batch_path, index=False)
-        all_csv_paths.append(batch_path)
+        print(f" Saved {batch_path}")
 
     return all_csv_paths
 
